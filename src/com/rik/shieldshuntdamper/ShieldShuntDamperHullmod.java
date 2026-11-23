@@ -12,6 +12,7 @@ import com.fs.starfarer.api.combat.ShipAPI;
 import com.fs.starfarer.api.combat.ShipAPI.HullSize;
 import com.fs.starfarer.api.combat.ShipHullSpecAPI;
 import com.fs.starfarer.api.combat.ShipSystemAPI;
+import com.fs.starfarer.api.combat.WeaponAPI;
 import com.fs.starfarer.api.combat.listeners.AdvanceableListener;
 import com.fs.starfarer.api.impl.campaign.ids.HullMods;
 import com.fs.starfarer.api.impl.campaign.ids.Tags;
@@ -187,15 +188,23 @@ public class ShieldShuntDamperHullmod extends BaseHullMod {
                 }
                 rightClickWasPressed = rightClickDown;
             } else {
+                // Smart AI trigger using Starsector's built-in ShipwideAIFlags
                 float currentHull = ship.getHullLevel();
-                boolean tookHullDamage = currentHull < lastHullLevel - 0.005f;
-                if (state == State.IDLE && charges > 0) {
-                    if (tookHullDamage || ship.getEngineController().isFlamedOut() ||
-                            (currentHull < 0.65f && ship.areAnyEnemiesInRange())) {
+                boolean tookHullDamage = currentHull < lastHullLevel - 0.002f;
+                lastHullLevel = currentHull;
+
+                if (state == State.IDLE && charges > 0 && ship.getAIFlags() != null) {
+                    com.fs.starfarer.api.combat.ShipwideAIFlags flags = ship.getAIFlags();
+                    boolean incomingDanger = flags.hasFlag(com.fs.starfarer.api.combat.ShipwideAIFlags.AIFlags.HAS_INCOMING_DAMAGE)
+                            || flags.hasFlag(com.fs.starfarer.api.combat.ShipwideAIFlags.AIFlags.IN_CRITICAL_DPS_DANGER)
+                            || flags.hasFlag(com.fs.starfarer.api.combat.ShipwideAIFlags.AIFlags.NEEDS_HELP);
+
+                    boolean highFluxDefense = ship.getFluxLevel() > 0.75f && ship.areAnyEnemiesInRange();
+
+                    if (incomingDanger || tookHullDamage || highFluxDefense || ship.getEngineController().isFlamedOut()) {
                         triggerRequested = true;
                     }
                 }
-                lastHullLevel = currentHull;
             }
 
             // 3. Handle Activation Input
@@ -250,6 +259,12 @@ public class ShieldShuntDamperHullmod extends BaseHullMod {
 
                 ship.setJitter(this, JITTER_COLOR, effectLevel, 2, 0f, 5f);
                 ship.setJitterUnder(this, JITTER_UNDER_COLOR, effectLevel, 25, 0f, 7f);
+
+                // Disable weapons while Damper Field is active (matches vanilla damper.system)
+                for (WeaponAPI weapon : ship.getAllWeapons()) {
+                    if (weapon.isDecorative()) continue;
+                    weapon.setForceNoFireOneFrame(true);
+                }
 
                 if (ship == Global.getCombatEngine().getPlayerShip()) {
                     int percent = (int) Math.round((1f - mult) * 100f);
