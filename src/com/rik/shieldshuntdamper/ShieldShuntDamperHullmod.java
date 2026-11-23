@@ -4,8 +4,13 @@ import java.awt.Color;
 import java.util.HashMap;
 import java.util.Map;
 
+import org.lwjgl.input.Mouse;
+import org.lwjgl.util.vector.Vector2f;
+
 import com.fs.starfarer.api.Global;
 import com.fs.starfarer.api.combat.BaseHullMod;
+import com.fs.starfarer.api.combat.CombatEntityAPI;
+import com.fs.starfarer.api.combat.DamagingProjectileAPI;
 import com.fs.starfarer.api.combat.MutableShipStatsAPI;
 import com.fs.starfarer.api.combat.ShieldAPI.ShieldType;
 import com.fs.starfarer.api.combat.ShipAPI;
@@ -14,6 +19,8 @@ import com.fs.starfarer.api.combat.ShipHullSpecAPI;
 import com.fs.starfarer.api.combat.ShipSystemAPI;
 import com.fs.starfarer.api.combat.WeaponAPI;
 import com.fs.starfarer.api.combat.listeners.AdvanceableListener;
+import com.fs.starfarer.api.combat.listeners.ApplyDamageResultAPI;
+import com.fs.starfarer.api.combat.listeners.DamageListener;
 import com.fs.starfarer.api.impl.campaign.ids.HullMods;
 import com.fs.starfarer.api.impl.campaign.ids.Tags;
 
@@ -143,7 +150,7 @@ public class ShieldShuntDamperHullmod extends BaseHullMod {
         return true;
     }
 
-    public static class RightClickDamperListener implements AdvanceableListener {
+    public static class RightClickDamperListener implements AdvanceableListener, DamageListener {
         private enum State { IDLE, CHARGEUP, ACTIVE, CHARGEDOWN }
 
         private final ShipAPI ship;
@@ -152,12 +159,22 @@ public class ShieldShuntDamperHullmod extends BaseHullMod {
         private int charges = MAX_CHARGES;
         private float regenProgress = 0f;
         private boolean rightClickWasPressed = false;
-        private float lastHullLevel;
+        private float recentDamageTaken = 0f;
+        private float damageWindowTimer = 0f;
         private final String modId = "shield_shunt_damper_active";
 
         public RightClickDamperListener(ShipAPI ship) {
             this.ship = ship;
-            this.lastHullLevel = ship.getHullLevel();
+        }
+
+        @Override
+        public void reportDamageApplied(Object source, CombatEntityAPI target, ApplyDamageResultAPI result) {
+            if (target != ship || result == null) return;
+            float dmg = result.getTotalDamageToArmor() + result.getDamageToHull() + result.getEmpDamage();
+            if (dmg > 0f) {
+                recentDamageTaken += dmg;
+                damageWindowTimer = 0.5f;
+            }
         }
 
         @Override
@@ -170,6 +187,13 @@ public class ShieldShuntDamperHullmod extends BaseHullMod {
                 ship.getPhaseCloak().deactivate();
             }
 
+            if (damageWindowTimer > 0f) {
+                damageWindowTimer -= amount;
+                if (damageWindowTimer <= 0f) {
+                    recentDamageTaken = 0f;
+                }
+            }
+
             // 1. Regenerate charges (0.05/sec = 20s per charge, up to 2 charges)
             if (charges < MAX_CHARGES) {
                 regenProgress += CHARGE_REGEN * amount;
@@ -179,31 +203,66 @@ public class ShieldShuntDamperHullmod extends BaseHullMod {
                 }
             }
 
-            // 2. Check Right-Click (Player) or AI trigger
+            // 2. Check Right-Click (Manual Player) or Close-Range Threat AI Trigger (Autopilot + AI Ships)
             boolean triggerRequested = false;
-            if (ship == Global.getCombatEngine().getPlayerShip()) {
-                boolean rightClickDown = org.lwjgl.input.Mouse.isButtonDown(1);
+            boolean isPlayerShip = (ship == Global.getCombatEngine().getPlayerShip());
+            boolean isManualPlayer = isPlayerShip && Global.getCombatEngine().isUIAutopilotOn();
+
+            if (isManualPlayer) {
+                boolean rightClickDown = Mouse.isButtonDown(1);
                 if (rightClickDown && !rightClickWasPressed) {
                     triggerRequested = true;
                 }
                 rightClickWasPressed = rightClickDown;
             } else {
-                // Smart AI trigger using Starsector's built-in ShipwideAIFlags
-                float currentHull = ship.getHullLevel();
-                boolean tookHullDamage = currentHull < lastHullLevel - 0.002f;
-                lastHullLevel = currentHull;
+                rightClickWasPressed = false;
+            }
 
-                if (state == State.IDLE && charges > 0 && ship.getAIFlags() != null) {
-                    com.fs.starfarer.api.combat.ShipwideAIFlags flags = ship.getAIFlags();
-                    boolean incomingDanger = flags.hasFlag(com.fs.starfarer.api.combat.ShipwideAIFlags.AIFlags.HAS_INCOMING_DAMAGE)
-                            || flags.hasFlag(com.fs.starfarer.api.combat.ShipwideAIFlags.AIFlags.IN_CRITICAL_DPS_DANGER)
-                            || flags.hasFlag(com.fs.starfarer.api.combat.ShipwideAIFlags.AIFlags.NEEDS_HELP);
+            // Run AI trigger for non-player ships AND when the player flagship is on Autopilot (U)
+            if (!isManualPlayer && !triggerRequested && state == State.IDLE && charges > 0) {
+                // A. Trigger under sustained heavy hits (>= 3.5% max HP in 0.5s)
+                float damageThreshold = ship.getMaxHitpoints() * 0.035f;
+                boolean heavyHits = recentDamageTaken >= damageThreshold;
 
-                    boolean highFluxDefense = ship.getFluxLevel() > 0.75f && ship.areAnyEnemiesInRange();
+                // B. Scan for dangerous incoming projectiles/missiles on a collision course within ~220su
+                boolean imminentImpact = false;
+                float hullRadius = ship.getCollisionRadius();
+                float dangerRadius = hullRadius + 220f;
+                float dangerRadiusSq = dangerRadius * dangerRadius;
+                Vector2f shipLoc = ship.getLocation();
 
-                    if (incomingDanger || tookHullDamage || highFluxDefense || ship.getEngineController().isFlamedOut()) {
-                        triggerRequested = true;
+                for (DamagingProjectileAPI proj : Global.getCombatEngine().getProjectiles()) {
+                    if (proj.getOwner() == ship.getOwner() || proj.isFading() || proj.didDamage()) continue;
+                    if (proj.getDamageAmount() < 120f) continue;
+
+                    float dx = proj.getLocation().x - shipLoc.x;
+                    float dy = proj.getLocation().y - shipLoc.y;
+                    float distSq = dx * dx + dy * dy;
+                    if (distSq > dangerRadiusSq) continue;
+
+                    float vx = proj.getVelocity().x;
+                    float vy = proj.getVelocity().y;
+                    float speedSq = vx * vx + vy * vy;
+                    if (speedSq <= 1f) continue;
+
+                    float toShipX = -dx;
+                    float toShipY = -dy;
+                    float dot = vx * toShipX + vy * toShipY;
+                    if (dot <= 0f) continue;
+
+                    float projDistSq = (toShipX * toShipX + toShipY * toShipY) - (dot * dot) / speedSq;
+                    if (projDistSq <= (hullRadius * 1.2f) * (hullRadius * 1.2f)) {
+                        imminentImpact = true;
+                        break;
                     }
+                }
+
+                // C. Emergency trigger if flamed out while taking damage
+                boolean emergencyState = ship.getEngineController().isFlamedOut() && recentDamageTaken > 0f;
+
+                if (heavyHits || imminentImpact || emergencyState) {
+                    triggerRequested = true;
+                    recentDamageTaken = 0f;
                 }
             }
 
@@ -214,7 +273,7 @@ public class ShieldShuntDamperHullmod extends BaseHullMod {
                     state = State.CHARGEUP;
                     stateTimer = CHARGE_UP;
                     Global.getSoundPlayer().playSound("system_damper", 1f, 1f, ship.getLocation(), ship.getVelocity());
-                } else if (ship == Global.getCombatEngine().getPlayerShip()) {
+                } else if (isManualPlayer) {
                     Global.getSoundPlayer().playSound("gun_out_of_ammo", 1f, 1f, ship.getLocation(), ship.getVelocity());
                 }
             }
@@ -266,7 +325,7 @@ public class ShieldShuntDamperHullmod extends BaseHullMod {
                     weapon.setForceNoFireOneFrame(true);
                 }
 
-                if (ship == Global.getCombatEngine().getPlayerShip()) {
+                if (isPlayerShip) {
                     int percent = (int) Math.round((1f - mult) * 100f);
                     Global.getCombatEngine().maintainStatusForPlayerShip(
                             modId,
@@ -281,7 +340,7 @@ public class ShieldShuntDamperHullmod extends BaseHullMod {
                 stats.getArmorDamageTakenMult().unmodify(modId);
                 stats.getEmpDamageTakenMult().unmodify(modId);
 
-                if (ship == Global.getCombatEngine().getPlayerShip()) {
+                if (isPlayerShip) {
                     String chargeText = (charges < MAX_CHARGES)
                             ? String.format("Charges: %d/%d (%d%%)", charges, MAX_CHARGES, (int)(regenProgress * 100))
                             : String.format("Charges: %d/%d (Ready)", charges, MAX_CHARGES);
